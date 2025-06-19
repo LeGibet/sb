@@ -690,7 +690,7 @@ list_inbounds() {
     echo -e "${BLUE}=== 当前入站列表 ===${NC}"
     
     local inbounds_info
-    inbounds_info=$(jq -r '.inbounds[] | "\(.tag)"' "$CONFIG_FILE" 2>/dev/null)
+    inbounds_info=$(jq -r '.inbounds[] | "\(.tag) \(.type) \(.listen_port)"' "$CONFIG_FILE" 2>/dev/null)
     
     if [ -z "$inbounds_info" ]; then
         echo -e "${YELLOW}暂无配置的入站。${NC}"
