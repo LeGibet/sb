@@ -690,7 +690,7 @@ list_inbounds() {
     echo -e "${BLUE}=== 当前入站列表 ===${NC}"
     
     local inbounds_info
-    inbounds_info=$(jq -r '.inbounds[] | "\(.tag) \(.type) \(.listen_port)"' "$CONFIG_FILE" 2>/dev/null)
+    inbounds_info=$(jq -r '.inbounds[] | "\(.tag)"' "$CONFIG_FILE" 2>/dev/null)
     
     if [ -z "$inbounds_info" ]; then
         echo -e "${YELLOW}暂无配置的入站。${NC}"
@@ -710,23 +710,49 @@ list_inbounds() {
 
 remove_inbound() {
     check_root
-    list_inbounds
-    echo
-    read -p "请输入要删除的入站标签 (如: ss-10000): " tag
-    if [ -z "$tag" ]; then
-        echo -e "${RED}标签不能为空。${NC}"
+    
+    # 先显示入站列表
+    if ! list_inbounds; then
         return 1
     fi
     
-    if ! jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then
-        echo -e "${RED}未找到标签为 '$tag' 的入站。${NC}"
+    # 获取入站总数
+    local total_inbounds
+    total_inbounds=$(jq '.inbounds | length' "$CONFIG_FILE" 2>/dev/null)
+    
+    if [ "$total_inbounds" -eq 0 ]; then
+        echo -e "${YELLOW}暂无可删除的入站。${NC}"
+        return 0
+    fi
+    
+    echo
+    read -p "请输入要删除的入站序号 [1-${total_inbounds}]: " choice
+    
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$total_inbounds" ]; then
+        echo -e "${RED}无效的序号。${NC}"
         return 1
+    fi
+    
+    # 获取要删除的入站标签 (数组索引从0开始，所以减1)
+    local tag_to_remove
+    tag_to_remove=$(jq -r ".inbounds[$((choice-1))].tag" "$CONFIG_FILE")
+    
+    if [ -z "$tag_to_remove" ] || [ "$tag_to_remove" = "null" ]; then
+        echo -e "${RED}无法获取入站信息。${NC}"
+        return 1
+    fi
+    
+    echo -e "${YELLOW}即将删除入站: $tag_to_remove${NC}"
+    read -p "确定要删除吗？(y/N): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo "操作已取消。"
+        return 0
     fi
     
     local new_json
-    new_json=$(jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' "$CONFIG_FILE")
+    new_json=$(jq "del(.inbounds[$((choice-1))])" "$CONFIG_FILE")
     if update_config_and_restart "${new_json}"; then
-        echo -e "${GREEN}入站 '$tag' 已删除。${NC}"
+        echo -e "${GREEN}入站 '$tag_to_remove' 已删除。${NC}"
     fi
 }
 
