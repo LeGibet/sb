@@ -447,9 +447,6 @@ setup_hysteria2() {
     local clash_server
     local clash_skip_cert_verify
     local cert_domain
-    
-    read -p "请输入伪装域名 (默认 www.swift.com): " masquerade_domain
-    masquerade_domain=${masquerade_domain:-www.swift.com}
 
     if [ "$cert_choice" = "2" ]; then
         read -p "请输入证书域名 (必须解析到本机IP): " cert_domain
@@ -489,6 +486,9 @@ setup_hysteria2() {
         clash_server="$server_ip"
         clash_skip_cert_verify=true
     fi
+
+    read -p "请输入伪装域名 (默认 www.swift.com): " masquerade_domain
+    masquerade_domain=${masquerade_domain:-www.swift.com}
 
     local hy2_config=$(jq -n \
         --argjson port "$port" \
