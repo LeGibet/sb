@@ -467,8 +467,8 @@ setup_hysteria2() {
             }')
         else
             echo -e "${YELLOW}未找到现有证书，将为 ${cert_domain} 申请新的ACME证书。${NC}"
-            read -p "请输入用于 ACME 的邮箱: " acme_email
-            if [ -z "$acme_email" ]; then echo -e "${RED}邮箱不能为空。${NC}"; return 1; fi
+            read -p "请输入用于 ACME 的邮箱 (默认 admin@example.com): " acme_email
+            acme_email=${acme_email:-admin@example.com}
             tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg acme_email "$acme_email" --arg cert_dir "$CERT_DIR" '{
                 "enabled": true, "alpn": ["h3"], "server_name": $server_name,
                 "acme": { "domain": $server_name, "email": $acme_email, "disable_http_challenge": true, "data_directory": $cert_dir }
@@ -563,7 +563,6 @@ setup_anytls() {
             echo -e "${YELLOW}未找到现有证书，将为 ${cert_domain} 申请新的ACME证书。${NC}"
             read -p "请输入用于 ACME 的邮箱 (默认 admin@example.com): " acme_email
             acme_email=${acme_email:-admin@example.com}
-            if [ -z "$acme_email" ]; then echo -e "${RED}邮箱不能为空。${NC}"; return 1; fi
             tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg acme_email "$acme_email" --arg cert_dir "$CERT_DIR" '{
                 "enabled": true, "server_name": $server_name,
                 "acme": { "domain": $server_name, "email": $acme_email, "disable_http_challenge": true, "data_directory": $cert_dir }
