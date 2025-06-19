@@ -452,6 +452,13 @@ setup_hysteria2() {
         read -p "请输入证书域名 (必须解析到本机IP): " cert_domain
         if [ -z "$cert_domain" ]; then echo -e "${RED}证书域名不能为空。${NC}"; return 1; fi
 
+        # 确保 ACME 目录权限正确
+        echo -e "${YELLOW}正在检查并设置证书目录权限...${NC}"
+        mkdir -p "$CERT_DIR"
+        if ! chown -R sing-box:sing-box "$CERT_DIR" 2>/dev/null; then
+            echo -e "${YELLOW}警告: 无法将证书目录所有者更改为 sing-box。如果 ACME 失败，请手动执行 'sudo chown -R sing-box:sing-box ${CERT_DIR}'。${NC}"
+        fi
+
         # sing-box/lego automatically stores certs in a 'certificates' subdirectory
         local cert_file="${CERT_DIR}/certificates/${cert_domain}.crt"
         local key_file="${CERT_DIR}/certificates/${cert_domain}.key"
@@ -548,6 +555,13 @@ setup_anytls() {
     if [ "$cert_choice" = "2" ]; then
         read -p "请输入证书域名 (必须解析到本机IP): " cert_domain
         if [ -z "$cert_domain" ]; then echo -e "${RED}证书域名不能为空。${NC}"; return 1; fi
+
+        # 确保 ACME 目录权限正确
+        echo -e "${YELLOW}正在检查并设置证书目录权限...${NC}"
+        mkdir -p "$CERT_DIR"
+        if ! chown -R sing-box:sing-box "$CERT_DIR" 2>/dev/null; then
+            echo -e "${YELLOW}警告: 无法将证书目录所有者更改为 sing-box。如果 ACME 失败，请手动执行 'sudo chown -R sing-box:sing-box ${CERT_DIR}'。${NC}"
+        fi
 
         # sing-box/lego automatically stores certs in a 'certificates' subdirectory
         local cert_file="${CERT_DIR}/certificates/${cert_domain}.crt"
