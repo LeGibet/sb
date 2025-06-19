@@ -12,6 +12,7 @@ set -euo pipefail
 SINGBOX_EXEC="/usr/bin/sing-box"
 CONFIG_FILE="/etc/sing-box/config.json"
 LOG_FILE="/var/log/sing-box.log"
+CERT_DIR="/etc/sing-box/cert"
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -145,6 +146,8 @@ EOF
 
     # 创建初始配置
     mkdir -p /etc/sing-box
+    mkdir -p "$CERT_DIR"
+    chown sing-box:sing-box "$CERT_DIR" 2>/dev/null || true
     # --- 配置文件处理 ---
     # 安装时，无条件覆盖配置文件，确保使用的是脚本定义的默认配置。
     echo -e "${YELLOW}正在创建/覆盖初始配置文件...${NC}"
@@ -451,19 +454,32 @@ setup_hysteria2() {
     if [ "$cert_choice" = "2" ]; then
         read -p "请输入证书域名 (必须解析到本机IP): " cert_domain
         if [ -z "$cert_domain" ]; then echo -e "${RED}证书域名不能为空。${NC}"; return 1; fi
-        read -p "请输入用于 ACME 的邮箱: " acme_email
-        if [ -z "$acme_email" ]; then echo -e "${RED}邮箱不能为空。${NC}"; return 1; fi
-        
-        tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg acme_email "$acme_email" '{
-            "enabled": true, "alpn": ["h3"], "server_name": $server_name,
-            "acme": { "domain": $server_name, "email": $acme_email, "disable_http_challenge": true }
-        }')
+
+        # sing-box/lego automatically stores certs in a 'certificates' subdirectory
+        local cert_file="${CERT_DIR}/certificates/${cert_domain}.crt"
+        local key_file="${CERT_DIR}/certificates/${cert_domain}.key"
+
+        if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
+            echo -e "${GREEN}检测到域名 ${cert_domain} 的现有ACME证书，将直接使用。${NC}"
+            tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg key_path "$key_file" --arg crt_path "$cert_file" '{
+                "enabled": true, "alpn": ["h3"], "server_name": $server_name,
+                "key_path": $key_path, "certificate_path": $crt_path
+            }')
+        else
+            echo -e "${YELLOW}未找到现有证书，将为 ${cert_domain} 申请新的ACME证书。${NC}"
+            read -p "请输入用于 ACME 的邮箱: " acme_email
+            if [ -z "$acme_email" ]; then echo -e "${RED}邮箱不能为空。${NC}"; return 1; fi
+            tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg acme_email "$acme_email" --arg cert_dir "$CERT_DIR" '{
+                "enabled": true, "alpn": ["h3"], "server_name": $server_name,
+                "acme": { "domain": $server_name, "email": $acme_email, "disable_http_challenge": true, "data_directory": $cert_dir }
+            }')
+        fi
         clash_server="$cert_domain"
         clash_skip_cert_verify=false
     else
         read -p "请输入用于自签名证书的域名 (默认 www.swift.com): " cert_domain
         cert_domain=${cert_domain:-www.swift.com}
-        local cert_paths=$(generate_self_signed_cert "/etc/sing-box/cert/hy2.key" "/etc/sing-box/cert/hy2.crt" "${cert_domain}")
+        local cert_paths=$(generate_self_signed_cert "${CERT_DIR}/hy2.key" "${CERT_DIR}/hy2.crt" "${cert_domain}")
         local key_path=$(echo "$cert_paths" | cut -d'|' -f1)
         local crt_path=$(echo "$cert_paths" | cut -d'|' -f2)
         tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg key_path "$key_path" --arg crt_path "$crt_path" '{
@@ -532,20 +548,33 @@ setup_anytls() {
     if [ "$cert_choice" = "2" ]; then
         read -p "请输入证书域名 (必须解析到本机IP): " cert_domain
         if [ -z "$cert_domain" ]; then echo -e "${RED}证书域名不能为空。${NC}"; return 1; fi
-        read -p "请输入用于 ACME 的邮箱 (默认 admin@example.com): " acme_email
-        acme_email=${acme_email:-admin@example.com}
-        if [ -z "$acme_email" ]; then echo -e "${RED}邮箱不能为空。${NC}"; return 1; fi
-        
-        tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg acme_email "$acme_email" '{
-            "enabled": true, "server_name": $server_name,
-            "acme": { "domain": $server_name, "email": $acme_email, "disable_http_challenge": true }
-        }')
+
+        # sing-box/lego automatically stores certs in a 'certificates' subdirectory
+        local cert_file="${CERT_DIR}/certificates/${cert_domain}.crt"
+        local key_file="${CERT_DIR}/certificates/${cert_domain}.key"
+
+        if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
+            echo -e "${GREEN}检测到域名 ${cert_domain} 的现有ACME证书，将直接使用。${NC}"
+            tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg key_path "$key_file" --arg crt_path "$cert_file" '{
+                "enabled": true, "server_name": $server_name,
+                "key_path": $key_path, "certificate_path": $crt_path
+            }')
+        else
+            echo -e "${YELLOW}未找到现有证书，将为 ${cert_domain} 申请新的ACME证书。${NC}"
+            read -p "请输入用于 ACME 的邮箱 (默认 admin@example.com): " acme_email
+            acme_email=${acme_email:-admin@example.com}
+            if [ -z "$acme_email" ]; then echo -e "${RED}邮箱不能为空。${NC}"; return 1; fi
+            tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg acme_email "$acme_email" --arg cert_dir "$CERT_DIR" '{
+                "enabled": true, "server_name": $server_name,
+                "acme": { "domain": $server_name, "email": $acme_email, "disable_http_challenge": true, "data_directory": $cert_dir }
+            }')
+        fi
         clash_server="$cert_domain"
         clash_skip_cert_verify=false
     else
         read -p "请输入用于自签名证书的域名 (默认 www.swift.com): " cert_domain
         cert_domain=${cert_domain:-www.swift.com}
-        local cert_paths=$(generate_self_signed_cert "/etc/sing-box/cert/anytls.key" "/etc/sing-box/cert/anytls.crt" "${cert_domain}")
+        local cert_paths=$(generate_self_signed_cert "${CERT_DIR}/anytls.key" "${CERT_DIR}/anytls.crt" "${cert_domain}")
         local key_path=$(echo "$cert_paths" | cut -d'|' -f1)
         local crt_path=$(echo "$cert_paths" | cut -d'|' -f2)
         tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg key_path "$key_path" --arg crt_path "$crt_path" '{
