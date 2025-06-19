@@ -30,13 +30,6 @@ check_root() {
     fi
 }
 
-wait_for_apt_lock() {
-    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
-        echo -e "${YELLOW}检测到系统正在进行其他包管理操作，请稍候...${NC}"
-        sleep 5
-    done
-}
-
 validate_port() {
     local port=$1
     if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
@@ -117,9 +110,7 @@ install_singbox() {
     
     if [ ${#packages_to_install[@]} -gt 0 ]; then
         echo -e "${YELLOW}正在安装基础依赖: ${packages_to_install[*]}...${NC}"
-        wait_for_apt_lock
         apt-get update
-        wait_for_apt_lock
         apt-get install -y "${packages_to_install[@]}"
     fi
 
@@ -144,9 +135,7 @@ EOF
     
     # 安装 sing-box
     echo -e "${YELLOW}正在安装 sing-box...${NC}"
-    wait_for_apt_lock
     apt-get update
-    wait_for_apt_lock
     apt-get install -y sing-box-beta
 
     if ! command -v "$SINGBOX_EXEC" &> /dev/null; then
@@ -159,6 +148,7 @@ EOF
     # --- 配置文件处理 ---
     # 安装时，无条件覆盖配置文件，确保使用的是脚本定义的默认配置。
     echo -e "${YELLOW}正在创建/覆盖初始配置文件...${NC}"
+    backup_config
     if ! command -v jq &> /dev/null; then
         echo -e "${RED}jq 未安装，无法创建配置文件${NC}"; return 1
     fi
@@ -221,9 +211,7 @@ update_singbox() {
     echo -e "${YELLOW}正在更新 sing-box...${NC}"
     echo -e "${CYAN}当前版本: $(${SINGBOX_EXEC} version)${NC}"
     
-    wait_for_apt_lock
     apt-get update
-    wait_for_apt_lock
     apt-get install -y --only-upgrade sing-box-beta
     
     echo -e "${YELLOW}正在重启 sing-box 服务...${NC}"
@@ -312,6 +300,19 @@ generate_self_signed_cert() {
 
 # --- 节点配置函数 ---
 
+add_inbound_config() {
+    local inbound_json=$1
+    if [ -z "${inbound_json}" ]; then
+        echo -e "${RED}错误: 传入的配置为空。${NC}" >&2
+        return 1
+    fi
+    
+    local new_json
+    new_json=$(jq --argjson inbound "${inbound_json}" '.inbounds += [$inbound]' "$CONFIG_FILE")
+    
+    update_config_and_restart "${new_json}"
+}
+
 setup_ss() {
     check_root
     echo -e "${BLUE}=== 配置 Shadowsocks 2022 ===${NC}"
@@ -338,11 +339,9 @@ setup_ss() {
                 "padding": true
             }
         }')
-    local new_json=$(jq ".inbounds += [${ss_config}]" "$CONFIG_FILE")
     
-    local new_tag="ss-${port}"
-    if update_config_and_restart "${new_json}"; then
-        echo -e "\n${GREEN}Shadowsocks 2022 添加成功。${NC}"
+    if add_inbound_config "${ss_config}"; then
+        echo -e "\n${GREEN}Shadowsocks 2022 入站添加成功。${NC}"
         echo -e "${YELLOW}--- Clash YAML 配置 ---${NC}"
         cat <<EOF
 proxies:
@@ -402,10 +401,9 @@ setup_vless() {
                 }
             }
         }')
-    local new_json=$(jq --argjson vless_config "$vless_config" '.inbounds += [$vless_config]' "$CONFIG_FILE")
     
-    if update_config_and_restart "${new_json}"; then
-        echo -e "\n${GREEN}VLESS+Vision+Reality 添加成功。${NC}"
+    if add_inbound_config "${vless_config}"; then
+        echo -e "\n${GREEN}VLESS 入站添加成功。${NC}"
         echo -e "${YELLOW}--- Clash YAML 配置 ---${NC}"
         cat <<EOF
 proxies:
@@ -435,48 +433,74 @@ setup_hysteria2() {
     local password=$(${SINGBOX_EXEC} generate rand --base64 16)
     local server_ip
     server_ip=$(get_server_ip) || return 1
-    read -p "请输入伪装域名 (默认 www.swift.com): " server_name
-    server_name=${server_name:-www.swift.com}
 
-    local cert_paths=$(generate_self_signed_cert "/etc/sing-box/cert/hy2.key" "/etc/sing-box/cert/hy2.crt" "${server_name}")
-    local key_path=$(echo "$cert_paths" | cut -d'|' -f1)
-    local crt_path=$(echo "$cert_paths" | cut -d'|' -f2)
+    echo "请选择证书类型:"
+    echo "  1) 自签名证书 (默认)"
+    echo "  2) ACME 自动申请"
+    read -p "请选择 [1-2]: " cert_choice
+    cert_choice=${cert_choice:-1}
+
+    local tls_config_json
+    local clash_server
+    local clash_skip_cert_verify
+    local cert_domain
+    
+    read -p "请输入伪装域名 (默认 www.swift.com): " masquerade_domain
+    masquerade_domain=${masquerade_domain:-www.swift.com}
+
+    if [ "$cert_choice" = "2" ]; then
+        read -p "请输入证书域名 (必须解析到本机IP): " cert_domain
+        if [ -z "$cert_domain" ]; then echo -e "${RED}证书域名不能为空。${NC}"; return 1; fi
+        read -p "请输入用于 ACME 的邮箱: " acme_email
+        if [ -z "$acme_email" ]; then echo -e "${RED}邮箱不能为空。${NC}"; return 1; fi
+        
+        tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg acme_email "$acme_email" '{
+            "enabled": true, "alpn": ["h3"], "server_name": $server_name,
+            "acme": { "domain": $server_name, "email": $acme_email, "disable_http_challenge": true }
+        }')
+        clash_server="$cert_domain"
+        clash_skip_cert_verify=false
+    else
+        read -p "请输入用于自签名证书的域名 (默认 www.swift.com): " cert_domain
+        cert_domain=${cert_domain:-www.swift.com}
+        local cert_paths=$(generate_self_signed_cert "/etc/sing-box/cert/hy2.key" "/etc/sing-box/cert/hy2.crt" "${cert_domain}")
+        local key_path=$(echo "$cert_paths" | cut -d'|' -f1)
+        local crt_path=$(echo "$cert_paths" | cut -d'|' -f2)
+        tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg key_path "$key_path" --arg crt_path "$crt_path" '{
+            "enabled": true, "alpn": ["h3"], "server_name": $server_name,
+            "key_path": $key_path, "certificate_path": $crt_path
+        }')
+        clash_server="$server_ip"
+        clash_skip_cert_verify=true
+    fi
 
     local hy2_config=$(jq -n \
         --argjson port "$port" \
         --arg password "$password" \
-        --arg server_name "$server_name" \
-        --arg key_path "$key_path" \
-        --arg crt_path "$crt_path" \
+        --arg masquerade_domain "$masquerade_domain" \
+        --argjson tls_config "$tls_config_json" \
         '{
             "type": "hysteria2",
             "tag": ("hy2-" + ($port|tostring)),
             "listen": "::",
             "listen_port": $port,
             "users": [ { "password": $password } ],
-            "masquerade": ("https://" + $server_name + ":443"),
-            "tls": {
-                "enabled": true,
-                "alpn": ["h3"],
-                "key_path": $key_path,
-                "certificate_path": $crt_path
-            } 
+            "masquerade": ("https://" + $masquerade_domain),
+            "tls": $tls_config
         }')
 
-    local new_json=$(jq ".inbounds += [${hy2_config}]" "$CONFIG_FILE")
-    
-    local new_tag="hy2-${port}"
-    if update_config_and_restart "${new_json}"; then
-        echo -e "\n${GREEN}Hysteria2 添加成功。${NC}"
+    if add_inbound_config "${hy2_config}"; then
+        echo -e "\n${GREEN}Hysteria2 入站添加成功。${NC}"
         echo -e "${YELLOW}--- Clash YAML 配置 ---${NC}"
         cat <<EOF
 proxies:
-  - name: "hy2-${server_ip}"
+  - name: "hy2-${clash_server}"
     type: hysteria2
-    server: ${server_ip}
+    server: ${clash_server}
     port: ${port}
     password: ${password}
-    skip-cert-verify: true
+    skip-cert-verify: ${clash_skip_cert_verify}
+    sni: ${cert_domain}
     alpn:
       - h3
 EOF
@@ -493,105 +517,188 @@ setup_anytls() {
     local password=$(${SINGBOX_EXEC} generate rand --base64 16)
     local server_ip
     server_ip=$(get_server_ip) || return 1
-    read -p "请输入证书域名 (默认 www.swift.com): " server_name
-    server_name=${server_name:-www.swift.com}
 
-    local cert_paths=$(generate_self_signed_cert "/etc/sing-box/cert/anytls.key" "/etc/sing-box/cert/anytls.crt" "${server_name}")
-    local key_path=$(echo "$cert_paths" | cut -d'|' -f1)
-    local crt_path=$(echo "$cert_paths" | cut -d'|' -f2)
+    echo "请选择证书类型:"
+    echo "  1) 自签名证书 (默认)"
+    echo "  2) ACME 自动申请"
+    read -p "请选择 [1-2]: " cert_choice
+    cert_choice=${cert_choice:-1}
+
+    local tls_config_json
+    local clash_server
+    local clash_skip_cert_verify
+    local cert_domain
+
+    if [ "$cert_choice" = "2" ]; then
+        read -p "请输入证书域名 (必须解析到本机IP): " cert_domain
+        if [ -z "$cert_domain" ]; then echo -e "${RED}证书域名不能为空。${NC}"; return 1; fi
+        read -p "请输入用于 ACME 的邮箱 (默认 admin@example.com): " acme_email
+        acme_email=${acme_email:-admin@example.com}
+        if [ -z "$acme_email" ]; then echo -e "${RED}邮箱不能为空。${NC}"; return 1; fi
+        
+        tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg acme_email "$acme_email" '{
+            "enabled": true, "server_name": $server_name,
+            "acme": { "domain": $server_name, "email": $acme_email, "disable_http_challenge": true }
+        }')
+        clash_server="$cert_domain"
+        clash_skip_cert_verify=false
+    else
+        read -p "请输入用于自签名证书的域名 (默认 www.swift.com): " cert_domain
+        cert_domain=${cert_domain:-www.swift.com}
+        local cert_paths=$(generate_self_signed_cert "/etc/sing-box/cert/anytls.key" "/etc/sing-box/cert/anytls.crt" "${cert_domain}")
+        local key_path=$(echo "$cert_paths" | cut -d'|' -f1)
+        local crt_path=$(echo "$cert_paths" | cut -d'|' -f2)
+        tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg key_path "$key_path" --arg crt_path "$crt_path" '{
+            "enabled": true, "server_name": $server_name,
+            "key_path": $key_path, "certificate_path": $crt_path
+        }')
+        clash_server="$server_ip"
+        clash_skip_cert_verify=true
+    fi
 
     local anytls_config=$(jq -n \
         --argjson port "$port" \
         --arg password "$password" \
-        --arg key_path "$key_path" \
-        --arg crt_path "$crt_path" \
+        --argjson tls_config "$tls_config_json" \
         '{
             "type": "anytls",
             "tag": ("anytls-" + ($port|tostring)),
             "listen": "::",
             "listen_port": $port,
-            "users": [
-                {
-                    "password": $password
-                }
-            ],
-            "tls": {
-                "enabled": true,
-                "key_path": $key_path,
-                "certificate_path": $crt_path
-            }
+            "users": [ { "password": $password } ],
+            "tls": $tls_config
         }')
-    local new_json=$(jq ".inbounds += [${anytls_config}]" "$CONFIG_FILE")
     
-    local new_tag="anytls-${port}"
-    if update_config_and_restart "${new_json}"; then
-        echo -e "\n${GREEN}AnyTLS 添加成功。${NC}"
+    if add_inbound_config "${anytls_config}"; then
+        echo -e "\n${GREEN}AnyTLS 入站添加成功。${NC}"
         echo -e "${YELLOW}--- Clash YAML 配置 ---${NC}"
         cat <<EOF
 proxies:
-  - name: "anytls-${server_ip}"
+  - name: "anytls-${clash_server}"
+    type: anytls
+    server: ${clash_server}
+    port: ${port}
+    password: "${password}"
+    tls: true
+    skip-cert-verify: ${clash_skip_cert_verify}
+    sni: ${cert_domain}
+EOF
+    fi
+}
+
+setup_anytls_reality() {
+    check_root
+    echo -e "${BLUE}=== 配置 AnyTLS+Reality ===${NC}"
+    read -p "请输入端口 (默认 8443): " port
+    port=${port:-8443}
+    ! check_port "${port}" && return 1
+
+    read -p "请输入伪装域名 (默认 www.swift.com): " server_name
+    server_name=${server_name:-www.swift.com}
+
+    local password=$(${SINGBOX_EXEC} generate rand --base64 16)
+    local keypair=$(${SINGBOX_EXEC} generate reality-keypair)
+    local private_key=$(echo "$keypair" | grep "PrivateKey" | awk '{print $2}')
+    local public_key=$(echo "$keypair" | grep "PublicKey" | awk '{print $2}')
+    local short_id=$(${SINGBOX_EXEC} generate rand --hex 8)
+    local server_ip
+    server_ip=$(get_server_ip) || return 1
+
+    local new_tag="anytls-reality-${port}"
+    local anytls_config=$(jq -n \
+        --arg tag "$new_tag" \
+        --argjson port "$port" \
+        --arg password "$password" \
+        --arg server_name "$server_name" \
+        --arg private_key "$private_key" \
+        --arg short_id "$short_id" \
+        '{
+            "type": "anytls",
+            "tag": $tag,
+            "listen": "::",
+            "listen_port": $port,
+            "users": [ { "password": $password } ],
+            "tls": {
+                "enabled": true,
+                "server_name": $server_name,
+                "reality": {
+                    "enabled": true,
+                    "handshake": { "server": $server_name, "server_port": 443 },
+                    "private_key": $private_key,
+                    "short_id": $short_id
+                }
+            }
+        }')
+
+    if add_inbound_config "${anytls_config}"; then
+        echo -e "\n${GREEN}AnyTLS+Reality 入站添加成功。${NC}"
+        echo -e "${YELLOW}--- Clash YAML 配置 ---${NC}"
+        cat <<EOF
+proxies:
+  - name: "anytls-reality-${server_ip}"
     type: anytls
     server: ${server_ip}
     port: ${port}
     password: "${password}"
     tls: true
-    alpn:
-      - h3
-    skip-cert-verify: true
+    sni: ${server_name}
+    skip-cert-verify: false
+    reality-opts:
+      public-key: ${public_key}
+      short-id: ${short_id}
 EOF
     fi
 }
 
 # --- 管理功能 ---
 
-list_nodes() {
+list_inbounds() {
     check_root
     if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "${RED}配置文件不存在。${NC}"
         return 1
     fi
     
-    echo -e "${BLUE}=== 当前节点列表 ===${NC}"
-    if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
-        echo -e "${YELLOW}暂无配置的节点。${NC}"
+    echo -e "${BLUE}=== 当前入站列表 ===${NC}"
+    
+    local inbounds_info
+    inbounds_info=$(jq -r '.inbounds[] | "\(.tag) \(.type) \(.listen_port)"' "$CONFIG_FILE" 2>/dev/null)
+    
+    if [ -z "$inbounds_info" ]; then
+        echo -e "${YELLOW}暂无配置的入站。${NC}"
         return 0
     fi
     
-    # 获取节点列表 (使用 mapfile 提高安全性)
-    local nodes
-    mapfile -t nodes < <(jq -r '.inbounds[] | .tag' "$CONFIG_FILE" 2>/dev/null)
-    if [ ${#nodes[@]} -eq 0 ]; then
-        echo -e "${YELLOW}暂无配置的节点。${NC}"
-        return 0
-    fi
-    
-    # 显示节点列表
-    for i in "${!nodes[@]}"; do
-        local tag="${nodes[$i]}"
-        local type=$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .type" "$CONFIG_FILE")
-        local port=$(jq -r ".inbounds[] | select(.tag == \"$tag\") | .listen_port" "$CONFIG_FILE")
-        echo "  $((i+1))) $tag - $type - 端口:$port"
-    done
+    local i=1
+    while IFS= read -r line; do
+        local tag type port
+        tag=$(echo "$line" | awk '{print $1}')
+        type=$(echo "$line" | awk '{print $2}')
+        port=$(echo "$line" | awk '{print $3}')
+        echo "  $i) $tag - $type - 端口:$port"
+        i=$((i+1))
+    done <<< "$inbounds_info"
 }
 
-remove_node() {
+remove_inbound() {
     check_root
-    list_nodes
+    list_inbounds
     echo
-    read -p "请输入要删除的节点标签 (如: ss-10000): " tag
+    read -p "请输入要删除的入站标签 (如: ss-10000): " tag
     if [ -z "$tag" ]; then
         echo -e "${RED}标签不能为空。${NC}"
         return 1
     fi
     
-    if ! jq -e ".inbounds[] | select(.tag == \"$tag\")" "$CONFIG_FILE" >/dev/null 2>&1; then
-        echo -e "${RED}未找到标签为 '$tag' 的节点。${NC}"
+    if ! jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${RED}未找到标签为 '$tag' 的入站。${NC}"
         return 1
     fi
     
-    local new_json=$(jq "del(.inbounds[] | select(.tag == \"$tag\"))" "$CONFIG_FILE")
+    local new_json
+    new_json=$(jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag))' "$CONFIG_FILE")
     if update_config_and_restart "${new_json}"; then
-        echo -e "${GREEN}节点 '$tag' 已删除。${NC}"
+        echo -e "${GREEN}入站 '$tag' 已删除。${NC}"
     fi
 }
 
@@ -689,23 +796,25 @@ uninstall_singbox() {
 
 # --- 菜单功能 ---
 
-show_add_node_menu() {
+show_add_inbound_menu() {
     echo -e "${GREEN}================================${NC}"
-    echo -e "${GREEN}    添加节点${NC}"
+    echo -e "${GREEN}    添加入站${NC}"
     echo -e "${GREEN}================================${NC}"
     echo
     echo "  1) Shadowsocks 2022"
     echo "  2) VLESS+Vision+Reality"
     echo "  3) Hysteria2"
     echo "  4) AnyTLS"
+    echo "  5) AnyTLS + Reality"
     echo
-    read -p "请选择节点类型 [1-4]: " choice
+    read -p "请选择协议类型 [1-5]: " choice
     
     case "$choice" in
         1) setup_ss ;;
         2) setup_vless ;;
         3) setup_hysteria2 ;;
         4) setup_anytls ;;
+        5) setup_anytls_reality ;;
         *) echo -e "${RED}无效选择。${NC}"; exit 1 ;;
     esac
 }
@@ -747,10 +856,10 @@ show_menu() {
     echo "  2) 更新 sing-box"
     echo "  3) 卸载 sing-box"
     echo
-    echo -e "${BLUE}节点管理:${NC}"
-    echo "  4) 添加节点"
-    echo "  5) 列出所有节点"
-    echo "  6) 删除节点"
+    echo -e "${BLUE}入站管理:${NC}"
+    echo "  4) 添加入站"
+    echo "  5) 列出所有入站"
+    echo "  6) 删除入站"
     echo
     echo -e "${BLUE}系统管理:${NC}"
     echo "  7) 服务控制"
@@ -763,9 +872,9 @@ show_menu() {
         1) install_singbox ;;
         2) update_singbox ;;
         3) uninstall_singbox ;;
-        4) show_add_node_menu ;;
-        5) list_nodes ;;
-        6) remove_node ;;
+        4) show_add_inbound_menu ;;
+        5) list_inbounds ;;
+        6) remove_inbound ;;
         7) show_service_menu ;;
         8) view_config ;;
         9) view_realtime_log ;;
