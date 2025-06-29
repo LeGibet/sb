@@ -272,18 +272,16 @@ generate_self_signed_cert() {
     local key_path=$1
     local crt_path=$2
     local server_name=$3
-    local timestamp=$(date +%s)
-    
-    # 如果证书已存在，添加时间戳避免覆盖
+    # 如果证书已存在，询问是否覆盖
     if [ -f "${key_path}" ] || [ -f "${crt_path}" ]; then
-        local key_dir=$(dirname "${key_path}")
-        local key_name=$(basename "${key_path}" .key)
-        local crt_dir=$(dirname "${crt_path}")
-        local crt_name=$(basename "${crt_path}" .crt)
-        
-        key_path="${key_dir}/${key_name}_${timestamp}.key"
-        crt_path="${crt_dir}/${crt_name}_${timestamp}.crt"
-        echo -e "${YELLOW}检测到证书文件已存在，使用新文件名避免覆盖${NC}" >&2
+        echo -e "${YELLOW}证书文件已存在: ${key_path} / ${crt_path}${NC}" >&2
+        read -p "是否覆盖现有证书? (y/N): " -r confirm_overwrite >&2
+        if [[ "$confirm_overwrite" != "y" && "$confirm_overwrite" != "Y" ]]; then
+            echo -e "${CYAN}操作已取消。将使用现有证书。${NC}" >&2
+            echo "${key_path}|${crt_path}"
+            return 0
+        fi
+        echo -e "${YELLOW}将覆盖现有证书...${NC}" >&2
     fi
     
     # 确保证书目录存在
@@ -299,6 +297,84 @@ generate_self_signed_cert() {
     
     # 返回实际使用的文件路径
     echo "${key_path}|${crt_path}"
+}
+
+_handle_tls_setup() {
+    local protocol_name=$1
+    local alpn_json=$2
+    local cert_choice
+
+    # Reset global variables
+    TLS_CONFIG_JSON=""
+    CLASH_SERVER=""
+    CLASH_SKIP_CERT_VERIFY=""
+    CERT_DOMAIN=""
+
+    echo "请选择证书类型:"
+    echo "  1) 自签名证书 (默认)"
+    echo "  2) ACME 自动申请"
+    read -p "请选择 [1-2]: " cert_choice
+    cert_choice=${cert_choice:-1}
+
+    if [ "$cert_choice" = "2" ]; then
+        echo -e "\n${YELLOW}警告: ACME申请需要80和443端口，请确保它们未被Caddy/Nginx等服务占用。${NC}"
+        read -r -p "确认端口可用后，按 Enter键 继续..."
+        
+        read -r -p "请输入证书域名 (必须解析到本机IP): " cert_domain_input
+        if [ -z "$cert_domain_input" ]; then echo -e "${RED}证书域名不能为空。${NC}"; return 1; fi
+        CERT_DOMAIN="$cert_domain_input"
+
+        echo -e "${YELLOW}正在检查并设置证书目录权限...${NC}"
+        mkdir -p "$CERT_DIR"
+        if ! chown -R sing-box:sing-box "$CERT_DIR" 2>/dev/null; then
+            echo -e "${YELLOW}警告: 无法将证书目录所有者更改为 sing-box。如果 ACME 失败，请手动执行 'sudo chown -R sing-box:sing-box ${CERT_DIR}'。${NC}"
+        fi
+
+        local cert_file="${CERT_DIR}/certificates/${CERT_DOMAIN}.crt"
+        local key_file="${CERT_DIR}/certificates/${CERT_DOMAIN}.key"
+
+        if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
+            echo -e "${GREEN}检测到域名 ${CERT_DOMAIN} 的现有ACME证书，将直接使用。${NC}"
+            TLS_CONFIG_JSON=$(jq -n --arg server_name "$CERT_DOMAIN" --arg key_path "$key_file" --arg crt_path "$cert_file" '{
+                "enabled": true, "server_name": $server_name,
+                "key_path": $key_path, "certificate_path": $crt_path
+            }')
+        else
+            echo -e "${YELLOW}未找到现有证书，将为 ${CERT_DOMAIN} 申请新的ACME证书。${NC}"
+            read -p "请输入用于 ACME 的邮箱 (默认 admin@gmail.com): " acme_email
+            acme_email=${acme_email:-admin@gmail.com}
+            TLS_CONFIG_JSON=$(jq -n --arg server_name "$CERT_DOMAIN" --arg acme_email "$acme_email" --arg cert_dir "$CERT_DIR" '{
+                "enabled": true, "server_name": $server_name,
+                "acme": { "domain": $server_name, "email": $acme_email, "disable_http_challenge": true, "data_directory": $cert_dir }
+            }')
+        fi
+        CLASH_SERVER="$CERT_DOMAIN"
+        CLASH_SKIP_CERT_VERIFY=false
+    else
+        read -p "请输入用于自签名证书的域名 (默认 www.swift.com): " cert_domain_input
+        CERT_DOMAIN=${cert_domain_input:-www.swift.com}
+        
+        local cert_paths
+        cert_paths=$(generate_self_signed_cert "${CERT_DIR}/${protocol_name}.key" "${CERT_DIR}/${protocol_name}.crt" "${CERT_DOMAIN}")
+        local key_path=$(echo "$cert_paths" | cut -d'|' -f1)
+        local crt_path=$(echo "$cert_paths" | cut -d'|' -f2)
+        
+        TLS_CONFIG_JSON=$(jq -n --arg server_name "$CERT_DOMAIN" --arg key_path "$key_path" --arg crt_path "$crt_path" '{
+            "enabled": true, "server_name": $server_name,
+            "key_path": $key_path, "certificate_path": $crt_path
+        }')
+        
+        local server_ip
+        server_ip=$(get_server_ip) || return 1
+        CLASH_SERVER="$server_ip"
+        CLASH_SKIP_CERT_VERIFY=true
+    fi
+
+    if [ "$alpn_json" != "null" ]; then
+        TLS_CONFIG_JSON=$(echo "$TLS_CONFIG_JSON" | jq --argjson alpn "$alpn_json" '. + {alpn: $alpn}')
+    fi
+    
+    return 0
 }
 
 # --- 节点配置函数 ---
@@ -318,7 +394,7 @@ add_inbound_config() {
 
 setup_ss() {
     check_root
-    echo -e "${BLUE}=== 配置 Shadowsocks 2022 ===${NC}"
+    echo -e "${BLUE}=== 配置 Shadowsocks (aes-128-gcm) ===${NC}"
     read -p "请输入端口 (默认 10000): " port
     port=${port:-10000}
     ! check_port "${port}" && return 1
@@ -335,6 +411,45 @@ setup_ss() {
             "tag": ("ss-" + ($port|tostring)),
             "listen": "::",
             "listen_port": $port,
+            "method": "aes-128-gcm",
+            "password": $password
+        }')
+    
+    if add_inbound_config "${ss_config}"; then
+        echo -e "\n${GREEN}Shadowsocks (aes-128-gcm) 入站添加成功。${NC}"
+        echo -e "${YELLOW}--- Clash YAML 配置 ---${NC}"
+        cat <<EOF
+proxies:
+  - name: "ss-${server_ip}"
+    type: ss
+    server: ${server_ip}
+    port: ${port}
+    cipher: aes-128-gcm
+    password: ${password}
+EOF
+    fi
+}
+
+setup_ss2022() {
+    check_root
+    echo -e "${BLUE}=== 配置 Shadowsocks 2022 ===${NC}"
+    read -p "请输入端口 (默认 10001): " port
+    port=${port:-10001}
+    ! check_port "${port}" && return 1
+    
+    local password=$(${SINGBOX_EXEC} generate rand --base64 16)
+    local server_ip
+    server_ip=$(get_server_ip) || return 1
+
+    local ss_config=$(jq -n \
+        --argjson port "$port" \
+        --arg password "$password" \
+        '{
+            "type": "shadowsocks",
+            "tag": ("ss2022-" + ($port|tostring)),
+            "listen": "::",
+            "listen_port": $port,
+            "network": "tcp",
             "method": "2022-blake3-aes-128-gcm",
             "password": $password,
             "multiplex": {
@@ -348,7 +463,7 @@ setup_ss() {
         echo -e "${YELLOW}--- Clash YAML 配置 ---${NC}"
         cat <<EOF
 proxies:
-  - name: "ss-${server_ip}"
+  - name: "ss2022-${server_ip}"
     type: ss
     server: ${server_ip}
     port: ${port}
@@ -433,75 +548,24 @@ setup_hysteria2() {
     port=${port:-10443}
     ! check_port "${port}" && return 1
 
-    local password=$(${SINGBOX_EXEC} generate rand --base64 16)
-    local server_ip
-    server_ip=$(get_server_ip) || return 1
-
-    echo "请选择证书类型:"
-    echo "  1) 自签名证书 (默认)"
-    echo "  2) ACME 自动申请"
-    read -p "请选择 [1-2]: " cert_choice
-    cert_choice=${cert_choice:-1}
-
-    local tls_config_json
-    local clash_server
-    local clash_skip_cert_verify
-    local cert_domain
-
-    if [ "$cert_choice" = "2" ]; then
-        read -p "请输入证书域名 (必须解析到本机IP): " cert_domain
-        if [ -z "$cert_domain" ]; then echo -e "${RED}证书域名不能为空。${NC}"; return 1; fi
-
-        # 确保 ACME 目录权限正确
-        echo -e "${YELLOW}正在检查并设置证书目录权限...${NC}"
-        mkdir -p "$CERT_DIR"
-        if ! chown -R sing-box:sing-box "$CERT_DIR" 2>/dev/null; then
-            echo -e "${YELLOW}警告: 无法将证书目录所有者更改为 sing-box。如果 ACME 失败，请手动执行 'sudo chown -R sing-box:sing-box ${CERT_DIR}'。${NC}"
-        fi
-
-        # sing-box/lego automatically stores certs in a 'certificates' subdirectory
-        local cert_file="${CERT_DIR}/certificates/${cert_domain}.crt"
-        local key_file="${CERT_DIR}/certificates/${cert_domain}.key"
-
-        if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
-            echo -e "${GREEN}检测到域名 ${cert_domain} 的现有ACME证书，将直接使用。${NC}"
-            tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg key_path "$key_file" --arg crt_path "$cert_file" '{
-                "enabled": true, "alpn": ["h3"], "server_name": $server_name,
-                "key_path": $key_path, "certificate_path": $crt_path
-            }')
-        else
-            echo -e "${YELLOW}未找到现有证书，将为 ${cert_domain} 申请新的ACME证书。${NC}"
-            read -p "请输入用于 ACME 的邮箱 (默认 admin@gmail.com): " acme_email
-            acme_email=${acme_email:-admin@gmail.com}
-            tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg acme_email "$acme_email" --arg cert_dir "$CERT_DIR" '{
-                "enabled": true, "alpn": ["h3"], "server_name": $server_name,
-                "acme": { "domain": $server_name, "email": $acme_email, "disable_http_challenge": true, "data_directory": $cert_dir }
-            }')
-        fi
-        clash_server="$cert_domain"
-        clash_skip_cert_verify=false
-    else
-        read -p "请输入用于自签名证书的域名 (默认 www.swift.com): " cert_domain
-        cert_domain=${cert_domain:-www.swift.com}
-        local cert_paths=$(generate_self_signed_cert "${CERT_DIR}/hy2.key" "${CERT_DIR}/hy2.crt" "${cert_domain}")
-        local key_path=$(echo "$cert_paths" | cut -d'|' -f1)
-        local crt_path=$(echo "$cert_paths" | cut -d'|' -f2)
-        tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg key_path "$key_path" --arg crt_path "$crt_path" '{
-            "enabled": true, "alpn": ["h3"], "server_name": $server_name,
-            "key_path": $key_path, "certificate_path": $crt_path
-        }')
-        clash_server="$server_ip"
-        clash_skip_cert_verify=true
+    local password
+    password=$(${SINGBOX_EXEC} generate rand --base64 16)
+    
+    # Call the new TLS handler
+    if ! _handle_tls_setup "hy2" '["h3"]'; then
+        return 1
     fi
+    # The helper sets: TLS_CONFIG_JSON, CLASH_SERVER, CLASH_SKIP_CERT_VERIFY, CERT_DOMAIN
 
     read -p "请输入伪装域名 (默认 www.swift.com): " masquerade_domain
     masquerade_domain=${masquerade_domain:-www.swift.com}
 
-    local hy2_config=$(jq -n \
+    local hy2_config
+    hy2_config=$(jq -n \
         --argjson port "$port" \
         --arg password "$password" \
         --arg masquerade_domain "$masquerade_domain" \
-        --argjson tls_config "$tls_config_json" \
+        --argjson tls_config "$TLS_CONFIG_JSON" \
         '{
             "type": "hysteria2",
             "tag": ("hy2-" + ($port|tostring)),
@@ -517,13 +581,13 @@ setup_hysteria2() {
         echo -e "${YELLOW}--- Clash YAML 配置 ---${NC}"
         cat <<EOF
 proxies:
-  - name: "hy2-${clash_server}"
+  - name: "hy2-${CLASH_SERVER}"
     type: hysteria2
-    server: ${clash_server}
+    server: ${CLASH_SERVER}
     port: ${port}
     password: ${password}
-    skip-cert-verify: ${clash_skip_cert_verify}
-    sni: ${cert_domain}
+    skip-cert-verify: ${CLASH_SKIP_CERT_VERIFY}
+    sni: ${CERT_DOMAIN}
     alpn:
       - h3
 EOF
@@ -537,71 +601,20 @@ setup_anytls() {
     port=${port:-8443}
     ! check_port "${port}" && return 1
 
-    local password=$(${SINGBOX_EXEC} generate rand --base64 16)
-    local server_ip
-    server_ip=$(get_server_ip) || return 1
+    local password
+    password=$(${SINGBOX_EXEC} generate rand --base64 16)
 
-    echo "请选择证书类型:"
-    echo "  1) 自签名证书 (默认)"
-    echo "  2) ACME 自动申请"
-    read -p "请选择 [1-2]: " cert_choice
-    cert_choice=${cert_choice:-1}
-
-    local tls_config_json
-    local clash_server
-    local clash_skip_cert_verify
-    local cert_domain
-
-    if [ "$cert_choice" = "2" ]; then
-        read -p "请输入证书域名 (必须解析到本机IP): " cert_domain
-        if [ -z "$cert_domain" ]; then echo -e "${RED}证书域名不能为空。${NC}"; return 1; fi
-
-        # 确保 ACME 目录权限正确
-        echo -e "${YELLOW}正在检查并设置证书目录权限...${NC}"
-        mkdir -p "$CERT_DIR"
-        if ! chown -R sing-box:sing-box "$CERT_DIR" 2>/dev/null; then
-            echo -e "${YELLOW}警告: 无法将证书目录所有者更改为 sing-box。如果 ACME 失败，请手动执行 'sudo chown -R sing-box:sing-box ${CERT_DIR}'。${NC}"
-        fi
-
-        # sing-box/lego automatically stores certs in a 'certificates' subdirectory
-        local cert_file="${CERT_DIR}/certificates/${cert_domain}.crt"
-        local key_file="${CERT_DIR}/certificates/${cert_domain}.key"
-
-        if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
-            echo -e "${GREEN}检测到域名 ${cert_domain} 的现有ACME证书，将直接使用。${NC}"
-            tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg key_path "$key_file" --arg crt_path "$cert_file" '{
-                "enabled": true, "server_name": $server_name,
-                "key_path": $key_path, "certificate_path": $crt_path
-            }')
-        else
-            echo -e "${YELLOW}未找到现有证书，将为 ${cert_domain} 申请新的ACME证书。${NC}"
-            read -p "请输入用于 ACME 的邮箱 (默认 admin@gmail.com): " acme_email
-            acme_email=${acme_email:-admin@gmail.com}
-            tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg acme_email "$acme_email" --arg cert_dir "$CERT_DIR" '{
-                "enabled": true, "server_name": $server_name,
-                "acme": { "domain": $server_name, "email": $acme_email, "disable_http_challenge": true, "data_directory": $cert_dir }
-            }')
-        fi
-        clash_server="$cert_domain"
-        clash_skip_cert_verify=false
-    else
-        read -p "请输入用于自签名证书的域名 (默认 www.swift.com): " cert_domain
-        cert_domain=${cert_domain:-www.swift.com}
-        local cert_paths=$(generate_self_signed_cert "${CERT_DIR}/anytls.key" "${CERT_DIR}/anytls.crt" "${cert_domain}")
-        local key_path=$(echo "$cert_paths" | cut -d'|' -f1)
-        local crt_path=$(echo "$cert_paths" | cut -d'|' -f2)
-        tls_config_json=$(jq -n --arg server_name "$cert_domain" --arg key_path "$key_path" --arg crt_path "$crt_path" '{
-            "enabled": true, "server_name": $server_name,
-            "key_path": $key_path, "certificate_path": $crt_path
-        }')
-        clash_server="$server_ip"
-        clash_skip_cert_verify=true
+    # Call the new TLS handler, no ALPN for AnyTLS
+    if ! _handle_tls_setup "anytls" "null"; then
+        return 1
     fi
+    # The helper sets: TLS_CONFIG_JSON, CLASH_SERVER, CLASH_SKIP_CERT_VERIFY, CERT_DOMAIN
 
-    local anytls_config=$(jq -n \
+    local anytls_config
+    anytls_config=$(jq -n \
         --argjson port "$port" \
         --arg password "$password" \
-        --argjson tls_config "$tls_config_json" \
+        --argjson tls_config "$TLS_CONFIG_JSON" \
         '{
             "type": "anytls",
             "tag": ("anytls-" + ($port|tostring)),
@@ -616,78 +629,14 @@ setup_anytls() {
         echo -e "${YELLOW}--- Clash YAML 配置 ---${NC}"
         cat <<EOF
 proxies:
-  - name: "anytls-${clash_server}"
+  - name: "anytls-${CLASH_SERVER}"
     type: anytls
-    server: ${clash_server}
+    server: ${CLASH_SERVER}
     port: ${port}
     password: "${password}"
     tls: true
-    skip-cert-verify: ${clash_skip_cert_verify}
-    sni: ${cert_domain}
-EOF
-    fi
-}
-
-setup_anytls_reality() {
-    check_root
-    echo -e "${BLUE}=== 配置 AnyTLS+Reality ===${NC}"
-    read -p "请输入端口 (默认 8443): " port
-    port=${port:-8443}
-    ! check_port "${port}" && return 1
-
-    read -p "请输入伪装域名 (默认 www.swift.com): " server_name
-    server_name=${server_name:-www.swift.com}
-
-    local password=$(${SINGBOX_EXEC} generate rand --base64 16)
-    local keypair=$(${SINGBOX_EXEC} generate reality-keypair)
-    local private_key=$(echo "$keypair" | grep "PrivateKey" | awk '{print $2}')
-    local public_key=$(echo "$keypair" | grep "PublicKey" | awk '{print $2}')
-    local short_id=$(${SINGBOX_EXEC} generate rand --hex 8)
-    local server_ip
-    server_ip=$(get_server_ip) || return 1
-
-    local new_tag="anytls-reality-${port}"
-    local anytls_config=$(jq -n \
-        --arg tag "$new_tag" \
-        --argjson port "$port" \
-        --arg password "$password" \
-        --arg server_name "$server_name" \
-        --arg private_key "$private_key" \
-        --arg short_id "$short_id" \
-        '{
-            "type": "anytls",
-            "tag": $tag,
-            "listen": "::",
-            "listen_port": $port,
-            "users": [ { "password": $password } ],
-            "tls": {
-                "enabled": true,
-                "server_name": $server_name,
-                "reality": {
-                    "enabled": true,
-                    "handshake": { "server": $server_name, "server_port": 443 },
-                    "private_key": $private_key,
-                    "short_id": $short_id
-                }
-            }
-        }')
-
-    if add_inbound_config "${anytls_config}"; then
-        echo -e "\n${GREEN}AnyTLS+Reality 入站添加成功。${NC}"
-        echo -e "${YELLOW}--- Clash YAML 配置 ---${NC}"
-        cat <<EOF
-proxies:
-  - name: "anytls-reality-${server_ip}"
-    type: anytls
-    server: ${server_ip}
-    port: ${port}
-    password: "${password}"
-    tls: true
-    sni: ${server_name}
-    skip-cert-verify: false
-    reality-opts:
-      public-key: ${public_key}
-      short-id: ${short_id}
+    skip-cert-verify: ${CLASH_SKIP_CERT_VERIFY}
+    sni: ${CERT_DOMAIN}
 EOF
     fi
 }
@@ -712,13 +661,11 @@ list_inbounds() {
     fi
     
     local i=1
-    while IFS= read -r line; do
-        local tag type port
-        tag=$(echo "$line" | awk '{print $1}')
-        type=$(echo "$line" | awk '{print $2}')
-        port=$(echo "$line" | awk '{print $3}')
-        echo "  $i) $tag - $type - 端口:$port"
-        i=$((i+1))
+    while read -r tag type port; do
+        if [ -n "$tag" ]; then # 确保行不为空
+            echo "  $i) $tag - $type - 端口:$port"
+            i=$((i+1))
+        fi
     done <<< "$inbounds_info"
 }
 
@@ -869,20 +816,20 @@ show_add_inbound_menu() {
     echo -e "${GREEN}    添加入站${NC}"
     echo -e "${GREEN}================================${NC}"
     echo
-    echo "  1) Shadowsocks 2022"
-    echo "  2) VLESS+Vision+Reality"
-    echo "  3) Hysteria2"
-    echo "  4) AnyTLS"
-    echo "  5) AnyTLS + Reality"
+    echo "  1) Shadowsocks"
+    echo "  2) Shadowsocks 2022"
+    echo "  3) VLESS+Vision+Reality"
+    echo "  4) Hysteria2"
+    echo "  5) AnyTLS"
     echo
     read -p "请选择协议类型 [1-5]: " choice
-    
+
     case "$choice" in
         1) setup_ss ;;
-        2) setup_vless ;;
-        3) setup_hysteria2 ;;
-        4) setup_anytls ;;
-        5) setup_anytls_reality ;;
+        2) setup_ss2022 ;;
+        3) setup_vless ;;
+        4) setup_hysteria2 ;;
+        5) setup_anytls ;;
         *) echo -e "${RED}无效选择。${NC}"; exit 1 ;;
     esac
 }
@@ -897,7 +844,6 @@ show_service_menu() {
     echo "  2) 停止服务"
     echo "  3) 重启服务"
     echo "  4) 查看服务状态"
-    echo "  5) 实时查看日志"
     echo
     read -p "请选择操作 [1-5]: " choice
     
@@ -906,7 +852,6 @@ show_service_menu() {
         2) stop_service ;;
         3) restart_service ;;
         4) view_status ;;
-        5) view_realtime_log ;;
         *) echo -e "${RED}无效选择。${NC}"; exit 1 ;;
     esac
 }
