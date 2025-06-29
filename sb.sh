@@ -217,6 +217,9 @@ update_singbox() {
     apt-get update
     apt-get install -y --only-upgrade sing-box-beta
     
+    echo -e "${YELLOW}正在重新加载 systemd 配置...${NC}"
+    systemctl daemon-reload
+    
     echo -e "${YELLOW}正在重启 sing-box 服务...${NC}"
     systemctl restart sing-box
     
