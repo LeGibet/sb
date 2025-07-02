@@ -416,6 +416,11 @@ setup_ss() {
             "listen_port": $port,
             "method": "aes-128-gcm",
             "password": $password
+            "network": "tcp",
+            "multiplex": {
+                "enabled": true,
+                "padding": true
+            }
         }')
     
     if add_inbound_config "${ss_config}"; then
@@ -429,6 +434,10 @@ proxies:
     port: ${port}
     cipher: aes-128-gcm
     password: ${password}
+    udp-over-tcp: true
+    smux:
+      enabled: true
+      padding: true
 EOF
     fi
 }
@@ -472,6 +481,7 @@ proxies:
     port: ${port}
     cipher: 2022-blake3-aes-128-gcm
     password: ${password}
+    udp-over-tcp: true
     smux:
       enabled: true
       padding: true
