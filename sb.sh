@@ -270,27 +270,24 @@ update_config_and_restart() {
     fi
 }
 
+# 简化版：确保自签名证书存在。如果不存在，则创建。
 generate_self_signed_cert() {
     check_root
     local key_path=$1
     local crt_path=$2
     local server_name=$3
-    # 如果证书已存在，询问是否覆盖
-    if [ -f "${key_path}" ] || [ -f "${crt_path}" ]; then
-        echo -e "${YELLOW}证书文件已存在: ${key_path} / ${crt_path}${NC}" >&2
-        read -p "是否覆盖现有证书? (y/N): " -r confirm_overwrite >&2
-        if [[ "$confirm_overwrite" != "y" && "$confirm_overwrite" != "Y" ]]; then
-            echo -e "${CYAN}操作已取消。将使用现有证书。${NC}" >&2
-            echo "${key_path}|${crt_path}"
-            return 0
-        fi
-        echo -e "${YELLOW}将覆盖现有证书...${NC}" >&2
+
+    # 如果证书文件已存在，直接返回路径，不再询问
+    if [ -f "${key_path}" ] && [ -f "${crt_path}" ]; then
+        echo -e "${GREEN}检测到现有自签名证书，将直接使用: ${crt_path}${NC}" >&2
+        echo "${key_path}|${crt_path}"
+        return 0
     fi
     
     # 确保证书目录存在
     mkdir -p "$(dirname "${key_path}")"
     
-    echo -e "${YELLOW}为 ${server_name} 生成自签名证书...${NC}" >&2
+    echo -e "${YELLOW}为 ${server_name} 生成新的自签名证书...${NC}" >&2
     echo -e "${CYAN}密钥文件: ${key_path}${NC}" >&2
     echo -e "${CYAN}证书文件: ${crt_path}${NC}" >&2
     
@@ -298,7 +295,7 @@ generate_self_signed_cert() {
     openssl req -new -x509 -days 3650 -key "${key_path}" -out "${crt_path}" -subj "/CN=${server_name}"
     echo -e "${GREEN}证书已生成。${NC}" >&2
     
-    # 返回实际使用的文件路径
+    # 返回文件路径
     echo "${key_path}|${crt_path}"
 }
 
@@ -354,8 +351,9 @@ _handle_tls_setup() {
         CLASH_SERVER="$CERT_DOMAIN"
         CLASH_SKIP_CERT_VERIFY=false
     else
-        read -p "请输入用于自签名证书的域名 (默认 www.swift.com): " cert_domain_input
-        CERT_DOMAIN=${cert_domain_input:-www.swift.com}
+        # 对于自签名证书，使用固定的域名，不再询问用户
+        CERT_DOMAIN="www.swift.com"
+        echo -e "${CYAN}正在为自签名证书准备环境，使用默认域名: ${CERT_DOMAIN}${NC}" >&2
         
         local cert_paths
         cert_paths=$(generate_self_signed_cert "${CERT_DIR}/${protocol_name}.key" "${CERT_DIR}/${protocol_name}.crt" "${CERT_DOMAIN}")
@@ -415,8 +413,7 @@ setup_ss() {
             "listen": "::",
             "listen_port": $port,
             "method": "aes-128-gcm",
-            "password": $password
-            "network": "tcp",
+            "password": $password,
             "multiplex": {
                 "enabled": true,
                 "padding": true
@@ -434,7 +431,6 @@ proxies:
     port: ${port}
     cipher: aes-128-gcm
     password: ${password}
-    udp-over-tcp: true
     smux:
       enabled: true
       padding: true
@@ -550,6 +546,7 @@ proxies:
     reality-opts:
       public-key: ${public_key}
       short-id: ${short_id}
+    client-fingerprint: "chrome"
 EOF
     fi
 }
@@ -650,6 +647,7 @@ proxies:
     tls: true
     skip-cert-verify: ${CLASH_SKIP_CERT_VERIFY}
     sni: ${CERT_DOMAIN}
+    client-fingerprint: "chrome"
 EOF
     fi
 }
