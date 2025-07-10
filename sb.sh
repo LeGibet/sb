@@ -652,6 +652,50 @@ EOF
     fi
 }
 
+setup_port_forward() {
+    check_root
+    echo -e "${BLUE}=== 配置端口转发 ===${NC}"
+    
+    read -p "请输入监听端口 (例如 1081): " listen_port
+    if [ -z "$listen_port" ]; then
+        echo -e "${RED}错误: 监听端口不能为空。${NC}"
+        return 1
+    fi
+    ! check_port "${listen_port}" && return 1
+
+    read -p "请输入目标地址 (IP或域名): " override_address
+    if [ -z "$override_address" ]; then
+        echo -e "${RED}错误: 目标地址不能为空。${NC}"
+        return 1
+    fi
+
+    read -p "请输入目标端口: " override_port
+    ! validate_port "${override_port}" && return 1
+
+    local new_tag="forward-${listen_port}"
+    local forward_config=$(jq -n \
+        --arg tag "$new_tag" \
+        --argjson listen_port "$listen_port" \
+        --arg override_address "$override_address" \
+        --argjson override_port "$override_port" \
+        '{
+            "type": "direct",
+            "tag": $tag,
+            "listen": "::",
+            "listen_port": $listen_port,
+            "override_address": $override_address,
+            "override_port": $override_port
+        }')
+
+    if add_inbound_config "${forward_config}"; then
+        echo -e "\n${GREEN}端口转发添加入站成功。${NC}"
+        echo -e "${YELLOW}--- 详情 ---${NC}"
+        echo "  监听端口: ${listen_port}"
+        echo "  目标地址: ${override_address}"
+        echo "  目标端口: ${override_port}"
+    fi
+}
+
 # --- 管理功能 ---
 
 list_inbounds() {
@@ -832,8 +876,9 @@ show_add_inbound_menu() {
     echo "  3) VLESS+Vision+Reality"
     echo "  4) Hysteria2"
     echo "  5) AnyTLS"
+    echo "  6) 端口转发 (Direct)"
     echo
-    read -p "请选择协议类型 [1-5]: " choice
+    read -p "请选择协议类型 [1-6]: " choice
 
     case "$choice" in
         1) setup_ss ;;
@@ -841,6 +886,7 @@ show_add_inbound_menu() {
         3) setup_vless ;;
         4) setup_hysteria2 ;;
         5) setup_anytls ;;
+        6) setup_port_forward ;;
         *) echo -e "${RED}无效选择。${NC}"; exit 1 ;;
     esac
 }
@@ -856,7 +902,7 @@ show_service_menu() {
     echo "  3) 重启服务"
     echo "  4) 查看服务状态"
     echo
-    read -p "请选择操作 [1-5]: " choice
+    read -p "请选择操作 [1-4]: " choice
     
     case "$choice" in
         1) start_service ;;
